@@ -3,8 +3,9 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import authentication routes
+# Import authentication and Customer 360 routes
 from app.auth import router as auth_router
+from app.customer360 import router as customer360_router
 
 app = FastAPI()
 
@@ -19,10 +20,11 @@ app.add_middleware(
 # Enable sessions for OAuth state and login data
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.getenv("SESSION_SECRET_KEY"),
+    secret_key=os.getenv("SESSION_SECRET_KEY", "default_secret_key"),
 )
 
 app.include_router(auth_router)
+app.include_router(customer360_router)
 
 #  endpoint
 @app.get("/")
