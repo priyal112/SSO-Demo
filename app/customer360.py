@@ -1,168 +1,227 @@
-import csv
 import io
-import json
-from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from typing import List, Dict, Any, Optional
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel, Field
 
-from app.schema_mapper import Customer360SchemaMapper
+from app.schema_mapper import (
+    Customer360SchemaMapper,
+    DataSourceSampler,
+    ValueSemanticAnalyzer,
+    CANONICAL_FIELDS
+)
 
-router = APIRouter(prefix="/api/customer360", tags=["Customer 360"])
+router = APIRouter(prefix="/api/customer360", tags=["Customer 360 Schema Mapper"])
 mapper = Customer360SchemaMapper()
 
 
-# -------------------------------------------------------------
-# Request & Response Models
-# -------------------------------------------------------------
-class ColumnMappingRequest(BaseModel):
-    columns: List[str] = Field(..., example=["full_name_normalized", "mobile_normalized", "phone_number"])
+# PYDANTIC SCHEMAS
 
+class MapColumnsRequest(BaseModel):
+    columns: List[str]
+    sample_rows: Optional[List[Dict[str, Any]]] = None
 
-class ColumnMappingResponse(BaseModel):
-    status: str
-    canonical_fields: List[str]
-    mappings: Dict[str, Dict[str, Any]]
+class AnalyzeSourceRequest(BaseModel):
+    csv_content: Optional[str] = None
+    records: Optional[List[Dict[str, Any]]] = None
+    sample_size: int = Field(default=10, ge=3, le=50)
 
-
-class TransformRecordsRequest(BaseModel):
-    records: List[Dict[str, Any]]
-    deduplicate: bool = True
-    composite_keys: Optional[List[str]] = Field(
-        default=["full_name", "mobile"],
-        description="Keys used to detect duplicate entries across rows"
+class MapDatabaseRequest(BaseModel):
+    connection_string: str = Field(
+        default="demo",
+        description="SQLAlchemy connection URI (e.g. 'sqlite:///my_data.db', 'postgresql://...', or 'demo' for instant sample data)"
     )
+    table_name: str = Field(
+        default="demo_customers",
+        description="Name of the table to sample (or 'demo_customers')"
+    )
+    sample_size: int = Field(default=10, ge=3, le=50)
+
+class TransformRequest(BaseModel):
+    records: List[Dict[str, Any]] = Field(
+        default=[
+            {"full_name_normalized": "Rahul Sharma", "contact_no": "+91 98765 43210", "email_id": "rahul@example.com", "city_name": "Bengaluru"},
+            {"name": "Rahul Sharma", "mobile": "9876543210", "email": "rahul@example.com", "city": "Bengaluru"}
+        ],
+        description="List of raw customer records to transform and deduplicate"
+    )
+    column_mappings: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional precomputed column mappings. If omitted, fields are automatically inferred from data samples!"
+    )
+    deduplicate: bool = True
 
 
-class TransformRecordsResponse(BaseModel):
-    status: str
-    total_input_records: int
-    deduplicated_records_count: int
-    duplicates_merged: int
-    records: List[Dict[str, Any]]
+# ENDPOINTS
 
-
-# -------------------------------------------------------------
-# Endpoints
-# -------------------------------------------------------------
 @router.get("/canonical-fields")
-async def get_canonical_fields():
-    """
-    Returns the list of 7 canonical fields supported by Customer 360.
-    """
+def get_canonical_fields():
+    """Returns the list of Customer 360 canonical target fields and their properties."""
     return {
         "status": "success",
-        "canonical_fields": list(mapper.canonical_schema.keys()),
-        "schema_details": mapper.canonical_schema,
+        "canonical_fields": CANONICAL_FIELDS
     }
 
 
-@router.post("/map-columns", response_model=ColumnMappingResponse)
-async def map_columns(payload: ColumnMappingRequest):
+@router.post("/map-columns")
+def map_columns(request: MapColumnsRequest):
     """
-    Intelligently maps incoming database or file columns to Customer 360's canonical fields.
-    Prevents duplicate schema fields on the frontend (e.g., 'full_name_normalized' -> 'full_name').
+    Infers canonical mappings for a list of column names.
+    If sample_rows are provided, value semantic profiling is applied.
     """
-    mappings = mapper.get_schema_mapping(payload.columns)
-    return ColumnMappingResponse(
-        status="success",
-        canonical_fields=list(mapper.canonical_schema.keys()),
-        mappings=mappings,
-    )
+    if not request.columns:
+        raise HTTPException(status_code=400, detail="Column list cannot be empty")
 
-
-@router.post("/transform", response_model=TransformRecordsResponse)
-async def transform_records(payload: TransformRecordsRequest):
-    """
-    Transforms raw records (from DB queries or uploads) into canonical Customer 360 records.
-    Merges columns pointing to the same canonical field and prevents duplicate rows.
-    """
-    raw_records = payload.records
-    transformed_records = [mapper.transform_row(row) for row in raw_records]
-
-    if payload.deduplicate:
-        final_records, merged_count = mapper.deduplicate_records(
-            transformed_records,
-            composite_keys=payload.composite_keys
+    if request.sample_rows:
+        mappings = mapper.get_smart_schema_mapping_from_samples(
+            request.sample_rows, columns=request.columns
         )
     else:
-        final_records = transformed_records
-        merged_count = 0
-
-    return TransformRecordsResponse(
-        status="success",
-        total_input_records=len(raw_records),
-        deduplicated_records_count=len(final_records),
-        duplicates_merged=merged_count,
-        records=final_records,
-    )
-
-
-@router.post("/upload")
-async def upload_file_and_map(
-    file: UploadFile = File(...),
-    deduplicate: bool = True,
-):
-    """
-    Upload a CSV or JSON file from any database/source.
-    Auto-maps columns, resolves variations, merges duplicates, and outputs Customer 360 records.
-    """
-    filename = file.filename.lower()
-    content = await file.read()
-
-    rows: List[Dict[str, Any]] = []
-
-    try:
-        if filename.endswith(".csv"):
-            text_stream = io.StringIO(content.decode("utf-8-sig"))
-            reader = csv.DictReader(text_stream)
-            rows = [dict(r) for r in reader]
-        elif filename.endswith(".json"):
-            data = json.loads(content.decode("utf-8"))
-            if isinstance(data, list):
-                rows = data
-            elif isinstance(data, dict) and "records" in data:
-                rows = data["records"]
-            else:
-                rows = [data]
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file format. Please upload a .csv or .json file."
-            )
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error parsing file content: {str(e)}"
-        )
-
-    if not rows:
-        return {
-            "status": "success",
-            "message": "File is empty or contains no records",
-            "total_records": 0,
-            "records": [],
-        }
-
-    # Extract all incoming column names
-    source_columns = list(rows[0].keys())
-    column_mappings = mapper.get_schema_mapping(source_columns)
-
-    # Transform all rows to canonical Customer 360 fields
-    transformed = [mapper.transform_row(r) for r in rows]
-
-    if deduplicate:
-        final_records, duplicates_merged = mapper.deduplicate_records(transformed)
-    else:
-        final_records = transformed
-        duplicates_merged = 0
+        mappings = {col: mapper.map_column_smart(col) for col in request.columns}
 
     return {
         "status": "success",
-        "file_name": file.filename,
-        "detected_columns": source_columns,
-        "column_mappings": column_mappings,
-        "total_source_rows": len(rows),
-        "deduplicated_rows": len(final_records),
+        "total_columns": len(request.columns),
+        "mappings": mappings
+    }
+
+
+@router.post("/analyze-source")
+def analyze_source(request: AnalyzeSourceRequest):
+    """
+    Analyzes connected CSV data or record sets.
+    Samples 5-10 rows, profiles cell values, and returns confidence scores and explanations.
+    """
+    if request.csv_content:
+        result = mapper.process_csv_dataset(
+            request.csv_content,
+            sample_size=request.sample_size,
+            deduplicate=False
+        )
+        return {
+            "status": "success",
+            "source_type": "csv",
+            "has_header_detected": result["has_header_detected"],
+            "columns": result["columns"],
+            "sample_rows_analyzed": result["sample_rows_analyzed"],
+            "total_rows": result["total_source_rows"],
+            "column_mappings": result["column_mappings"],
+            "sample_records_preview": result["sample_records_preview"]
+        }
+
+    elif request.records:
+        effective_sample_size = min(request.sample_size, len(request.records))
+        sample_rows = request.records[:effective_sample_size]
+        cols = list(sample_rows[0].keys()) if sample_rows else []
+        mappings = mapper.get_smart_schema_mapping_from_samples(sample_rows, columns=cols)
+
+        return {
+            "status": "success",
+            "source_type": "records",
+            "columns": cols,
+            "sample_rows_analyzed": len(sample_rows),
+            "total_rows": len(request.records),
+            "column_mappings": mappings,
+            "sample_records_preview": [mapper.transform_row_with_mapping(r, mappings) for r in sample_rows[:5]]
+        }
+    else:
+        raise HTTPException(status_code=400, detail="Either csv_content or records must be provided")
+
+
+@router.post("/map-database")
+def map_database(request: MapDatabaseRequest):
+    """
+    Connects to a SQL database table, samples 5-10 rows randomly,
+    and infers canonical schema mappings.
+    """
+    try:
+        columns, sample_rows = DataSourceSampler.sample_database(
+            request.connection_string,
+            request.table_name,
+            sample_size=request.sample_size
+        )
+        mappings = mapper.get_smart_schema_mapping_from_samples(sample_rows, columns=columns)
+
+        return {
+            "status": "success",
+            "table_name": request.table_name,
+            "sample_rows_analyzed": len(sample_rows),
+            "columns": columns,
+            "column_mappings": mappings,
+            "sample_rows": sample_rows[:5]
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Database connection error: {str(e)}")
+
+
+@router.post("/upload")
+async def upload_csv(
+    file: UploadFile = File(...),
+    deduplicate: bool = Form(default=True),
+    sample_size: int = Form(default=10)
+):
+   
+    try:
+        content_bytes = await file.read()
+        csv_text = content_bytes.decode("utf-8", errors="replace")
+
+        result = mapper.process_csv_dataset(
+            csv_text,
+            sample_size=sample_size,
+            deduplicate=deduplicate
+        )
+
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "has_header_detected": result["has_header_detected"],
+            "detected_columns": result["columns"],
+            "sample_rows_analyzed": result["sample_rows_analyzed"],
+            "total_records": result["total_source_rows"],
+            "deduplicated_records_count": result["deduplicated_rows"],
+            "duplicates_merged": result["duplicates_merged"],
+            "column_mappings": result["column_mappings"],
+            "records": result["all_records"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
+
+
+@router.post("/transform")
+def transform_records(request: TransformRequest):
+    
+    if not request.records:
+        return {"status": "success", "total_input_records": 0, "records": []}
+
+    # Infer mappings if not provided or if dummy placeholder mappings were sent
+    has_valid_mapping = False
+    if request.column_mappings:
+        # Check if mappings contains non-empty definitions
+        has_valid_mapping = any(
+            isinstance(v, str) or (isinstance(v, dict) and bool(v.get("canonical_field") or v.get("canonical")))
+            for v in request.column_mappings.values()
+        )
+
+    if not has_valid_mapping:
+        cols = list(request.records[0].keys()) if request.records else []
+        sample_rows = request.records[:10]
+        mappings = mapper.get_smart_schema_mapping_from_samples(sample_rows, columns=cols)
+    else:
+        mappings = request.column_mappings
+
+    transformed = [mapper.transform_row_with_mapping(r, mappings) for r in request.records]
+
+    duplicates_merged = 0
+    final_records = transformed
+    if request.deduplicate:
+        final_records, duplicates_merged = mapper.deduplicate_records(transformed)
+
+    return {
+        "status": "success",
+        "total_input_records": len(request.records),
+        "deduplicated_records_count": len(final_records),
         "duplicates_merged": duplicates_merged,
-        "records": final_records,
+        "column_mappings": mappings,
+        "records": final_records
     }

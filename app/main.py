@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.auth import router as auth_router
 from app.customer360 import router as customer360_router
 
-app = FastAPI()
+app = FastAPI(title="SSO Demo & Customer 360 Smart Schema Mapper")
 
 app.add_middleware(
     CORSMiddleware,
